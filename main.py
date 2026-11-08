@@ -1,3 +1,4 @@
+import os
 import argparse
 import asyncio
 import logging
@@ -697,16 +698,50 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        default=False,
+        help="Publish forecasts to Metaculus (default: False / dry run)",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    # Default to False: dry run safety switch prevents unintentional submission
+    publish_to_metaculus = args.publish
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Configure LLMs in order of preference:
+    # (a) Metaculus credits / OpenRouter key if OPENROUTER_API_KEY is set
+    # (b) Free Google AI Studio Gemini key if GEMINI_API_KEY is set
+    bot_llms = None
+    if os.getenv("OPENROUTER_API_KEY"):
+        bot_llms = {
+            "default": GeneralLlm(
+                model="openrouter/openai/gpt-4o",
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "summarizer": "openrouter/openai/gpt-4o-mini",
+            "researcher": "openrouter/openai/gpt-4o",
+            "parser": "openrouter/openai/gpt-4o-mini",
+        }
+    elif os.getenv("GEMINI_API_KEY"):
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini/gemini-flash-lite-latest")
+        bot_llms = {
+            "default": GeneralLlm(
+                model=gemini_model,
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "summarizer": gemini_model,
+            "researcher": gemini_model,
+            "parser": gemini_model,
+        }
+
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -715,17 +750,7 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms=bot_llms,
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
@@ -769,10 +794,14 @@ if __name__ == "__main__":
         # the recommended target for smoke-testing your bot.
         # https://www.metaculus.com/tournament/bot-testing-area/
         template_bot.skip_previously_forecasted_questions = False
+        template_bot.predictions_per_research_report = 1
+        all_qs = client.get_all_open_questions_from_tournament("bot-testing-area")
+        target_ids = {43327, 46223, 43323}
+        qs = [q for q in all_qs if getattr(q, "id_of_post", None) in target_ids]
+        if not qs:
+            qs = all_qs[:3]
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
+            template_bot.forecast_questions(qs, return_exceptions=True)
         )
 
     template_bot.log_report_summary(forecast_reports)
